@@ -1,0 +1,389 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Blood for a Way — a tiny 2D sacrifice game</title>
+<style>
+  html, body {
+    height: 100%;
+    margin: 0;
+    background: #0e0e10;
+    color: #e8e6e3;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+    display: grid;
+    place-items: center;
+  }
+  .frame {
+    display: grid;
+    gap: 8px;
+    place-items: center;
+  }
+  canvas {
+    image-rendering: pixelated;
+    image-rendering: crisp-edges;
+    background: #0b0b0c;
+    border: 4px solid #2b2b30;
+    box-shadow: 0 10px 30px rgba(0,0,0,0.6), inset 0 0 0 2px #111;
+    border-radius: 12px;
+  }
+  .hud {
+    text-align: center;
+    opacity: 0.9;
+    font-size: 14px;
+    line-height: 1.2;
+  }
+  .btnrow { display: flex; gap: 8px; }
+  button {
+    background: #1f1f24;
+    color: #e8e6e3;
+    border: 1px solid #2f2f35;
+    padding: 8px 12px;
+    border-radius: 10px;
+    cursor: pointer;
+  }
+  button:hover { background:#25252b; }
+  .small { font-size: 12px; opacity: 0.8; }
+</style>
+</head>
+<body>
+  <div class="frame">
+    <canvas id="game" width="320" height="240"></canvas>
+    <div class="hud">
+      <div><strong>Controls:</strong> ← → move, Z/↑/Space jump, S sacrifice, R reset</div>
+      <div class="small">Goal: reach the glowing exit at the top-right. Sacrificing costs 1 HP and spawns a temporary blood platform beneath you.</div>
+      <div class="btnrow">
+        <button id="resetBtn">Reset</button>
+        <button id="harderBtn">Harder</button>
+        <button id="easierBtn">Easier</button>
+      </div>
+    </div>
+  </div>
+<script>
+(() => {
+  // ----- Config -----
+  const TILE = 16;
+  const WIDTH = 20, HEIGHT = 15; // tiles
+  const CANVAS_SCALE = Math.floor(Math.min((window.innerWidth*0.9)/(WIDTH*TILE), (window.innerHeight*0.8)/(HEIGHT*TILE)));
+  const canvas = document.getElementById("game");
+  canvas.style.width = (WIDTH*TILE*CANVAS_SCALE) + "px";
+  canvas.style.height = (HEIGHT*TILE*CANVAS_SCALE) + "px";
+  const ctx = canvas.getContext("2d");
+
+  // Colors (simple palette)
+  const COL = {
+    bg: "#0b0b0c",
+    wall: "#6e3b32",
+    wallEdge: "#8b5146",
+    exit: "#f7e26b",
+    player: "#e43d5b",
+    playerDark: "#a12234",
+    gem: "#7dd3fc",
+    blood: "#b91c1c",
+    text: "#e8e6e3",
+    spike: "#9ca3af"
+  };
+
+  // Level: 20x15 - '#' solid, 'E' exit (non-solid), '.' empty
+  const mapRows = [
+    "####################",
+    "#.................E#",
+    "#..................#",
+    "#..................#",
+    "#..................#",
+    "#..................#",
+    "#..................#",
+    "#..................#",
+    "#..................#",
+    "#..................#",
+    "#..................#",
+    "#..................#",
+    "#..................#",
+    "#..................#",
+    "####################",
+  ];
+  const map = mapRows.map(r => r.split(""));
+  function tileAt(tx, ty) {
+    if (tx < 0 || ty < 0 || tx >= WIDTH || ty >= HEIGHT) return "#"; // treat OOB as solid
+    return map[ty][tx];
+  }
+  function isSolidTile(ch) {
+    return ch === "#";
+  }
+
+  // ----- Player -----
+  const start = { x: 2*TILE, y: 12*TILE };
+  const player = {
+    x: start.x, y: start.y,
+    w: 12, h: 14,
+    vx: 0, vy: 0,
+    onGround: false,
+    hp: 5,
+    maxhp: 5,
+    sacrifices: 0,
+    alive: true, won: false
+  };
+
+  // Dynamic blood platforms
+  let bloodPlatforms = []; // each: {x,y,ttl}
+  let platformTTL = 7.0; // seconds
+  let maxPlatforms = 12;
+
+  // Difficulty toggles
+  function setDifficulty(delta) {
+    platformTTL = Math.max(2, Math.min(12, platformTTL + delta));
+  }
+
+  // Input
+  const keys = {};
+  window.addEventListener("keydown", e => { keys[e.code] = true; if (["ArrowUp","Space","KeyZ"].includes(e.code)) e.preventDefault(); });
+  window.addEventListener("keyup", e => { keys[e.code] = false; });
+
+  document.getElementById("resetBtn").onclick = () => reset();
+  document.getElementById("harderBtn").onclick = () => setDifficulty(-1);
+  document.getElementById("easierBtn").onclick = () => setDifficulty(+1);
+
+  function reset() {
+    Object.assign(player, { x: start.x, y: start.y, vx: 0, vy: 0, onGround: false, hp: player.maxhp, sacrifices: 0, alive: true, won: false });
+    bloodPlatforms = [];
+  }
+
+  function rectIntersect(ax, ay, aw, ah, bx, by, bw, bh) {
+    return ax < bx + bw && ax + aw > bx && ay < by + bh && ay + ah > by;
+  }
+
+  function solidAtRect(x, y, w, h) {
+    // check tiles
+    const minTx = Math.floor(x / TILE);
+    const maxTx = Math.floor((x + w - 1) / TILE);
+    const minTy = Math.floor(y / TILE);
+    const maxTy = Math.floor((y + h - 1) / TILE);
+    for (let ty = minTy; ty <= maxTy; ty++) {
+      for (let tx = minTx; tx <= maxTx; tx++) {
+        const t = tileAt(tx, ty);
+        if (isSolidTile(t)) {
+          const rx = tx * TILE, ry = ty * TILE;
+          if (rectIntersect(x, y, w, h, rx, ry, TILE, TILE)) return {tx, ty, rx, ry};
+        }
+      }
+    }
+    // check blood platforms
+    for (const p of bloodPlatforms) {
+      const rx = p.x*TILE, ry = p.y*TILE;
+      if (rectIntersect(x, y, w, h, rx, ry, TILE, TILE)) return { rx, ry, tx: p.x, ty: p.y, blood:true };
+    }
+    return null;
+  }
+
+  function isExitAtRect(x, y, w, h) {
+    const minTx = Math.floor(x / TILE);
+    const maxTx = Math.floor((x + w - 1) / TILE);
+    const minTy = Math.floor(y / TILE);
+    const maxTy = Math.floor((y + h - 1) / TILE);
+    for (let ty = minTy; ty <= maxTy; ty++) {
+      for (let tx = minTx; tx <= maxTx; tx++) {
+        if (tileAt(tx, ty) === "E") return true;
+      }
+    }
+    return false;
+  }
+
+  // Place a blood platform beneath the player (grid snapped)
+  function trySacrifice() {
+    if (!player.alive || player.won) return;
+    if (player.hp <= 1) return; // can't sacrifice last HP
+    const gx = Math.floor((player.x + player.w/2) / TILE);
+    const gyBelow = Math.floor((player.y + player.h + 1) / TILE);
+    // Find nearest free spot within 2 tiles down
+    let target = null;
+    for (let dy = 0; dy <= 2; dy++) {
+      const ty = gyBelow + dy;
+      if (!isSolidTile(tileAt(gx, ty)) && !bloodPlatforms.some(p => p.x === gx && p.y === ty)) {
+        target = { x: gx, y: ty };
+        break;
+      }
+    }
+    if (!target) return;
+    // commit
+    player.hp -= 1;
+    player.sacrifices += 1;
+    // limit number: pop oldest
+    while (bloodPlatforms.length >= maxPlatforms) bloodPlatforms.shift();
+    bloodPlatforms.push({ x: target.x, y: target.y, ttl: platformTTL });
+    // bounce up slightly as a feel effect
+    player.vy = -2.2;
+  }
+
+  // Game loop
+  let last = performance.now();
+  function loop(now) {
+    const dt = Math.min(0.05, (now - last) / 1000); // clamp to avoid huge steps
+    last = now;
+    update(dt);
+    draw();
+    requestAnimationFrame(loop);
+  }
+
+  function update(dt) {
+    if (!player.alive || player.won) {
+      if (keys["KeyR"]) reset();
+      return;
+    }
+
+    // Controls
+    const left = keys["ArrowLeft"] || keys["KeyA"];
+    const right = keys["ArrowRight"] || keys["KeyD"];
+    const jump = keys["ArrowUp"] || keys["Space"] || keys["KeyZ"];
+    if (keys["KeyS"]) { keys["KeyS"] = false; trySacrifice(); } // single press
+
+    // Horizontal move
+    const accel = 0.5;
+    const maxSpeed = 2.0;
+    if (left && !right) player.vx = Math.max(player.vx - accel, -maxSpeed);
+    else if (right && !left) player.vx = Math.min(player.vx + accel, +maxSpeed);
+    else player.vx *= 0.8;
+
+    // Gravity + jump
+    const GRAV = 0.38;
+    const JUMP_V = -5.2;
+    player.vy += GRAV;
+    if (jump && player.onGround) {
+      player.vy = JUMP_V;
+      player.onGround = false;
+    }
+
+    // Move X and resolve
+    player.x += player.vx;
+    let hit = solidAtRect(player.x, player.y, player.w, player.h);
+    if (hit) {
+      if (player.vx > 0) player.x = hit.rx - player.w; // push left
+      else if (player.vx < 0) player.x = hit.rx + TILE; // push right
+      player.vx = 0;
+    }
+
+    // Move Y and resolve
+    player.y += player.vy;
+    hit = solidAtRect(player.x, player.y, player.w, player.h);
+    if (hit) {
+      if (player.vy > 0) { // falling onto solid
+        player.y = hit.ry - player.h;
+        player.vy = 0;
+        player.onGround = true;
+      } else if (player.vy < 0) { // bump head
+        player.y = hit.ry + TILE;
+        player.vy = 0.1;
+      }
+    } else {
+      player.onGround = false;
+    }
+
+    // death if fall below screen
+    if (player.y > HEIGHT * TILE + 10) {
+      player.alive = false;
+    }
+
+    // Win?
+    if (isExitAtRect(player.x, player.y, player.w, player.h)) {
+      player.won = true;
+    }
+
+    // Decay platforms
+    for (const p of bloodPlatforms) p.ttl -= dt;
+    bloodPlatforms = bloodPlatforms.filter(p => p.ttl > 0);
+  }
+
+  function draw() {
+    // clear
+    ctx.fillStyle = COL.bg;
+    ctx.fillRect(0,0,canvas.width,canvas.height);
+
+    // parallax-ish gradient
+    for (let y=0;y<HEIGHT;y++){
+      const shade = 12 + Math.floor((y/HEIGHT)*18);
+      ctx.fillStyle = `hsl(240 8% ${shade}%)`;
+      ctx.fillRect(0, y*TILE, WIDTH*TILE, TILE);
+    }
+
+    // tiles
+    for (let ty=0; ty<HEIGHT; ty++) {
+      for (let tx=0; tx<WIDTH; tx++) {
+        const t = map[ty][tx];
+        if (t === "#") {
+          // brick
+          ctx.fillStyle = COL.wall;
+          ctx.fillRect(tx*TILE, ty*TILE, TILE, TILE);
+          ctx.fillStyle = COL.wallEdge;
+          ctx.fillRect(tx*TILE, ty*TILE, TILE, 3);
+          ctx.fillRect(tx*TILE, ty*TILE+TILE-3, TILE, 3);
+        } else if (t === "E") {
+          // exit glow
+          const cx = tx*TILE + TILE/2, cy = ty*TILE + TILE/2;
+          for (let r=7; r>0; r--) {
+            ctx.globalAlpha = 0.08 * r;
+            ctx.fillStyle = COL.exit;
+            ctx.beginPath();
+            ctx.arc(cx, cy, r*2, 0, Math.PI*2);
+            ctx.fill();
+            ctx.globalAlpha = 1;
+          }
+          ctx.fillStyle = COL.exit;
+          ctx.fillRect(tx*TILE+5, ty*TILE+5, 6, 6);
+        }
+      }
+    }
+
+    // blood platforms
+    for (const p of bloodPlatforms) {
+      const alpha = Math.min(1, Math.max(0.35, p.ttl / platformTTL));
+      ctx.globalAlpha = alpha;
+      ctx.fillStyle = COL.blood;
+      ctx.fillRect(p.x*TILE, p.y*TILE, TILE, TILE);
+      ctx.globalAlpha = 1;
+    }
+
+    // player
+    ctx.fillStyle = COL.player;
+    ctx.fillRect(Math.floor(player.x), Math.floor(player.y), player.w, player.h);
+    // shadow outline
+    ctx.strokeStyle = COL.playerDark;
+    ctx.lineWidth = 1;
+    ctx.strokeRect(Math.floor(player.x)+0.5, Math.floor(player.y)+0.5, player.w, player.h);
+
+    // UI
+    ctx.fillStyle = COL.text;
+    ctx.font = "10px monospace";
+    ctx.textBaseline = "top";
+    const msg = `HP ${player.hp}/${player.maxhp}  Sacrifices ${player.sacrifices}  Platform TTL ${platformTTL.toFixed(0)}s`;
+    ctx.fillText(msg, 6, 6);
+
+    if (!player.alive) {
+      banner("You fell.\nPress R to retry");
+    }
+    if (player.won) {
+      banner("ESCAPED!\nPress R to play again");
+    }
+  }
+
+  function banner(text) {
+    const lines = text.split("\n");
+    const w = 210, h = 50;
+    const x = (canvas.width - w)/2, y = (canvas.height - h)/2;
+    ctx.fillStyle = "rgba(0,0,0,0.75)";
+    ctx.fillRect(x, y, w, h);
+    ctx.strokeStyle = "#ffffff";
+    ctx.strokeRect(x+0.5, y+0.5, w, h);
+    ctx.fillStyle = "#ffffff";
+    ctx.font = "12px monospace";
+    for (let i=0;i<lines.length;i++) {
+      const tw = ctx.measureText(lines[i]).width;
+      ctx.fillText(lines[i], x + (w - tw)/2, y + 12 + i*16);
+    }
+  }
+
+  // kick off
+  reset();
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
